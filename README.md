@@ -1,6 +1,6 @@
 # Value Space Codebase
 
-Analysis pipeline for 2-photon calcium imaging with behavioral electrophysiology. Aligns suite2p neural traces to Axon (.abf) stimulus recordings, segments ROIs by cortical region, runs stimulus decoding, and extracts pupil dynamics via DeepLabCut.
+Analysis pipeline for 2-photon calcium imaging and electrophysiology with behavioral data for the value space project. Aligns neural traces to Axon (.abf) stimulus recordings, segments ROIs by cortical region, runs stimulus decoding, and extracts pupil dynamics via DeepLabCut.
 
 ## Setup
 
