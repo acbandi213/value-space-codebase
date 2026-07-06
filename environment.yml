@@ -1,0 +1,23 @@
+name: runyan_lab_alignment
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy>=1.22
+  - scipy>=1.8
+  - pandas>=1.4
+  - matplotlib>=3.5
+  - scikit-learn>=1.0
+  - pillow>=9.0
+  - opencv>=4.5
+  - h5py>=3.0
+  - seaborn>=0.11
+  - numba>=0.55
+  - neo>=0.10
+  - ffmpeg>=4.4
+  - jupyter
+  - pip
+  - pip:
+    - oasis-deconv>=0.2
+    - deeplabcut>=2.3

@@ -1,0 +1,41 @@
+# Byte-compiled / cached
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Data files (large / subject-specific)
+*.abf
+*.h5
+*.hdf5
+*.mat
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.tif
+*.tiff
+*.avi
+*.mp4
+
+# Generated plots
+*.png
+
+# Suite2p outputs
+suite2p/
+
+# DeepLabCut outputs
+*-DLC-*/
+dlc-models/
+
+# Claude Code
+.claude/
+
+# Conda / virtualenv
+.conda/
+.venv/
