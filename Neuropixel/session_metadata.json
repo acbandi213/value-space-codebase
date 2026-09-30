@@ -1,0 +1,77 @@
+{
+  "session": "2026-08-26T17:03:17 (start-time file, UTC-4)",
+  "raw_root": "/Volumes/Research/YttriMiceInJailRecordings082626",
+  "acquisition": "Open Ephys ONIX via Bonsai; Neuropixels 2.0 (np2-a), 384 channels recorded on 2 shanks (x = 0/32 um and 250/282 um; y = 720-4005 um)",
+  "ephys": {
+    "file": "np2-a-ephys_2026-08-26T17_03_17.raw",
+    "dtype": "uint16",
+    "n_channels": 384,
+    "n_samples": 171236310,
+    "nominal_fs_hz": 30000.0,
+    "hardware_clock_hz": 250000000.0,
+    "ticks_per_sample": 8333.33,
+    "measured_fs_from_clock_hz": 29999.73097141257,
+    "duration_s": 5707.9,
+    "clock_file": "np2-a-clock_2026-08-26T17_03_17.raw (uint64 tick per sample, first tick 466020 = 1.86 ms after clock start)"
+  },
+  "sort": {
+    "folder": "kilosort4_a",
+    "kilosort": "4.1.7",
+    "curation": "phy + bombcell; manual label column rf_label",
+    "preliminary_copy_identical": true,
+    "probe_drift_um_over_session": "~8 (Kilosort drift_amount.png)"
+  },
+  "video": {
+    "raw_file": "video2026-08-26T17_03_17.mkv (21.9 GB)",
+    "compressed_file": "preliminary data /Neuropixel_open_field/video_compressed.mkv (ffmpeg/x265 crf 24)",
+    "frames_in_file": 418492,
+    "nominal_fps": 59.63700234192037,
+    "resolution": [
+      2148,
+      2064
+    ],
+    "camera_timestamps_file": "camera_timestamps2026-08-26T17_03_17.csv (ns, camera device clock, one row per camera frame)",
+    "camera_frames_logged": 420924,
+    "camera_fps_measured": 59.6374,
+    "camera_skipped_frames": 2,
+    "frames_dropped_by_writer": 2432,
+    "drop_positions_known": false,
+    "container_timestamps": "synthetic constant-rate PTS in both raw and compressed MKV (verified by scanning block headers); drop positions unrecoverable",
+    "raw_writer": "Lavf62.13.100 / h264_nvenc (Bonsai ffmpeg writer), DefaultDuration 16.768113 ms"
+  },
+  "sync": {
+    "method": "cross-correlation of video motion energy with good-unit population rate, 5-min blocks",
+    "model": "t_ephys = a + (1 + b) * t_video_container",
+    "a_s": 0.29125149176387916,
+    "b": 0.006065991757465416,
+    "effective_fps": 59.27742596461525,
+    "residual_sd_s": 0.18,
+    "note": "camera and ONIX clocks are independent; digital_inputs CSV has no timestamp column (Pin4 toggles 3094 times, identity unknown)"
+  },
+  "tracking": {
+    "method": "mouse_tracker.py: rolling-median background subtraction on the dark trunk, motion-scored candidate selection, position hold when resting; heading from direction of travel",
+    "video": "cache/video_small/chunk_*.mp4 (crop x 90:2040, y 80:2040 of the original, scale 0.4, CLAHE)",
+    "frames_tracked": "100% of 338272 ephys-span frames (95% direct, 5% held)",
+    "heading_reliable": false,
+    "px_per_cm_assumed": 16.84,
+    "arena_side_cm_assumed": 45.0,
+    "wall_interfaces": "empirical nose-reach polylines per wall (cache/wall_boundaries_session.json); top wall has a ~7 cm obstruction over its middle 25 cm"
+  },
+  "events": {
+    "file": "cache/approach_events_session.csv",
+    "n_episodes": 595,
+    "investigations_per_wall": {
+      "top": 171,
+      "right": 69,
+      "bottom": 66,
+      "left": 48
+    },
+    "zone_time_pct": {
+      "top": 7.94,
+      "right": 4.08,
+      "bottom": 4.27,
+      "left": 2.18
+    },
+    "note": "commitment-dependent outcomes provisional (heading unreliable)"
+  }
+}

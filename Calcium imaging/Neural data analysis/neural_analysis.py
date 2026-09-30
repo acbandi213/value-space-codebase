@@ -285,6 +285,65 @@ class NeuralAnalysis:
         fig.colorbar(im, cax=cax, label="Z-scored ΔF/F")
         return fig
 
+    # ---------------------------------------- 2b. overlay mean traces (multi-stim)
+    def plot_mean_traces_overlay(self, stims=None, region=None, colors=None,
+                                 legend_labels=None,
+                                 xlabel="time from onset (s)",
+                                 ylabel="Z-scored ΔF/F",
+                                 show_sem=True, smooth_sigma=0,
+                                 figsize=(4, 2.5), dpi=300, ax=None):
+        """Overlay population-mean traces for several stimuli on one axis.
+
+        Parameters
+        ----------
+        stims : list of stimulus names (default: Male, Female, 3DMouse, FamFood)
+        colors : dict {stim_name: color} or list of colors (one per stim)
+        legend_labels : dict {stim_name: label} or list of labels (one per stim)
+        xlabel, ylabel : axis labels (edit these to customize the figure)
+        """
+        from scipy.ndimage import gaussian_filter1d
+
+        def _smooth(x):
+            if smooth_sigma > 0:
+                return gaussian_filter1d(x, sigma=smooth_sigma, axis=-1)
+            return x
+
+        stims = stims or ["Male", "Female", "3DMouse", "FamFood"]
+        stims = [s for s in stims if len(self._trials_for(s))]
+        if not stims:
+            raise ValueError("none of the requested stimuli have trials in this dataset")
+
+        if colors is None:
+            colors = {s: c for s, c in zip(stims, plt.get_cmap("tab10").colors)}
+        elif isinstance(colors, (list, tuple)):
+            colors = {s: c for s, c in zip(stims, colors)}
+
+        if legend_labels is None:
+            legend_labels = {s: STIM_LABELS.get(s, s) for s in stims}
+        elif isinstance(legend_labels, (list, tuple)):
+            legend_labels = {s: lab for s, lab in zip(stims, legend_labels)}
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+        else:
+            fig = ax.figure
+
+        for stim in stims:
+            m = self.condition_mean(stim, region)
+            pop = _smooth(m.mean(0))
+            color = colors[stim]
+            ax.plot(self.time, pop, lw=1.2, color=color, label=legend_labels[stim])
+            if show_sem:
+                sem = _smooth(m.std(0) / np.sqrt(max(m.shape[0], 1)))
+                ax.fill_between(self.time, pop - sem, pop + sem, color=color, alpha=0.2)
+
+        ax.axvline(0, color="k", ls="--", lw=0.8)
+        ax.axhline(0, color="0.7", lw=0.5)
+        ax.set(xlabel=xlabel, ylabel=ylabel, xlim=(self.time[0], self.time[-1]))
+        ax.legend(fontsize=6, loc="best", frameon=False)
+        fig.tight_layout()
+        return fig
+
     # ------------------------------------------------ 3. preferential neurons
     def neuron_responses(self, window=(0, None), region=None):
         """Per-trial per-neuron scalar response = mean Xz over the window.

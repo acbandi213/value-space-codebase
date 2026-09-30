@@ -89,6 +89,9 @@ class AlignmentSession:
         self.stim = []           # list of per-acquisition stim event dicts
         self.suite2p = {}        # F, Fneu, iscell, spks, ops, fs, frames_per_folder
         self.dff = None          # (n_neurons, n_frames_total)
+        self.light = None        # additive light-bleed trace (n_frames_total,), if corrected
+        self.F0 = None           # time-varying baseline (method="maximin")
+        self.dark_offset = 0.0
         self.z_dff = None
         self.deconv = None
         self.frame_offsets = None  # cumulative neural-frame offset per acquisition
@@ -260,7 +263,8 @@ class AlignmentSession:
         return self
 
     # ------------------------------------------------ 3b. entry/present/exit
-    def parse_stim(self, long_thresh_s=2.0, entry_gap_s=1.5, estimate_missing=True):
+    def parse_stim(self, long_thresh_s=2.0, entry_gap_s=1.5, estimate_missing=True,
+                   merge_gap_s=1.0):
         """Parse IN4 boxcars into entry / presentation / exit TRIALS.
 
         Each stimulus creates: a short ENTRY pulse, a long (~7-10 s) PRESENTATION
@@ -275,6 +279,10 @@ class AlignmentSession:
         entry->presentation delay of the good trials (``kind="estimated"``,
         ``present_estimated=True``), so it is still included in tensors.
 
+        Two consecutive long pulses separated by less than ``merge_gap_s`` are a
+        single presentation split by a TTL dropout and are merged (set 0/None to
+        disable).
+
         Trials are anchored on the PRESENTATION onset. Sets ``self.stim_trials``:
         a per-acquisition list of trial dicts ordered in time.
         """
@@ -285,6 +293,25 @@ class AlignmentSession:
             fs = self.abf[a]["fs"]
             on = st["onset_samples"].astype(float)
             off = st["offset_samples"].astype(float)
+            # merge long pulses split by a brief TTL dropout: a presentation can't
+            # directly follow a presentation (there must be an exit + entry between)
+            if merge_gap_s and len(on):
+                long0 = (off - on) / fs > long_thresh_s
+                keep_on, keep_off, keep_long = [on[0]], [off[0]], [long0[0]]
+                for i in range(1, len(on)):
+                    gap = (on[i] - keep_off[-1]) / fs
+                    if keep_long[-1] and long0[i] and gap < merge_gap_s:
+                        self._log(f"[parse] {self.abf[a]['name']}: merged split presentation "
+                                  f"at {keep_on[-1]/fs:.2f}s (gap {gap*1000:.0f} ms)")
+                        keep_off[-1] = off[i]
+                    else:
+                        keep_on.append(on[i]); keep_off.append(off[i]); keep_long.append(long0[i])
+                if len(keep_on) < len(on):
+                    on, off = np.array(keep_on), np.array(keep_off)
+                    st["onset_samples"], st["offset_samples"] = on.astype(int), off.astype(int)
+                    st["onset_s"], st["offset_s"] = on / fs, off / fs
+                    st["duration_s"] = (off - on) / fs
+                    st["n"] = len(on)
             dur = (off - on) / fs
             is_long = dur > long_thresh_s
             n = len(on)
@@ -382,13 +409,14 @@ class AlignmentSession:
         return [sorted(g) for g in groups.values()]
 
     def attach_stim_log(self, csv_path, tseries_col="T-series",
-                        stim_col="Stim", trial_col="Trial", notes_col="Notes"):
+                        stim_col="Stim", trial_col="Trial", notes_col="Notes", strict=True):
         """Attach stimulus identities from a logstimuli.csv.
 
         Rows are grouped by ``T-series`` (assumed to match acquisition order) and
         assigned to the parsed trials in time order. Aborted trials still consume
-        a stimulus slot so the ordering stays correct. Warns if the number of
-        detected trials does not match the number of log rows for an acquisition.
+        a stimulus slot so the ordering stays correct. If the number of detected
+        trials does not match the number of log rows for an acquisition, raises
+        ValueError (labels would be shifted); pass ``strict=False`` to only warn.
         """
         import pandas as pd
         if not self.stim_trials:
@@ -411,6 +439,8 @@ class AlignmentSession:
                 msg = (f"acq{a} (T-series {ts}): {len(trials)} detected trials vs "
                        f"{len(labels)} log rows — check alignment near aborted trials")
                 self.stim_log_report.append(msg)
+                if strict:
+                    raise ValueError(msg + " — labels would be shifted; fix parsing or pass strict=False")
                 self._log("[stimlog] !!", msg)
             for t, lab in zip(trials, labels):
                 t["stim"] = lab["stim"]; t["log_trial"] = lab["log_trial"]
@@ -452,6 +482,7 @@ class AlignmentSession:
                 fpf = true_fpf
         self.suite2p = {
             "F": F[cells], "Fneu": Fneu[cells],
+            "F_all": F, "Fneu_all": Fneu,          # every ROI — used to estimate light bleed
             "spks": spks[cells] if spks is not None else None,
             "iscell": iscell, "cell_idx": cells, "ops": ops,
             "fs": float(ops.get("fs", np.nan)),
@@ -503,66 +534,152 @@ class AlignmentSession:
             out[:, lo:hi] = (seg - (V @ co).T + seg.mean(1, keepdims=True)).astype(np.float32)
         return out
 
+    def estimate_light(self):
+        """Additive light-bleed trace (raw F units, median ~0), one value per frame.
+
+        Stray light adds the SAME absolute fluorescence to every pixel, so it shows
+        up identically in every ROI's neuropil trace, while neural signals differ
+        between neuropil masks. The frame-wise median across all ROIs' neuropil
+        traces (each minus its own session median) therefore tracks the light and
+        rejects local neural activity. Sets and returns ``self.light``."""
+        R = self.suite2p["Fneu_all"].astype(float)
+        self.light = np.median(R - np.median(R, axis=1, keepdims=True), axis=0).astype(np.float32)
+        return self.light
+
+    def resolve_dark_offset(self, dark_offset):
+        """Dark / PMT offset in raw F units. None -> 0 (no subtraction);
+        "auto" -> 1st percentile of suite2p meanImg (the darkest pixels, i.e. no
+        fluorescence); a number is used as given."""
+        if dark_offset is None:
+            return 0.0
+        if isinstance(dark_offset, str):
+            if dark_offset != "auto":
+                raise ValueError('dark_offset must be None, "auto" or a number')
+            return float(np.percentile(self.suite2p["ops"]["meanImg"], 1))
+        return float(dark_offset)
+
+    def _acq_bounds(self, T):
+        fpf = self.suite2p.get("frames_per_folder")
+        if fpf is not None and int(np.asarray(fpf).sum()) == T:
+            e = np.concatenate([[0], np.cumsum(np.asarray(fpf))]).astype(int)
+            return [(int(e[i]), int(e[i + 1])) for i in range(len(e) - 1) if e[i + 1] > e[i]]
+        return [(0, T)]
+
+    def _maximin_baseline(self, f, win_s=30.0, sigma_s=1.0):
+        """Time-varying F0 (suite2p-style "maximin"), per acquisition: gaussian
+        smooth (``sigma_s``), then a running min and a running max over ``win_s``.
+        Follows monotonic trends exactly (bleaching, the fast decay after each
+        acquisition starts) while ignoring positive transients shorter than
+        ``win_s``. Never crosses acquisition boundaries."""
+        from scipy.ndimage import gaussian_filter1d, minimum_filter1d, maximum_filter1d
+        fs = self.suite2p["fs"]
+        w = max(3, int(round(win_s * fs)))
+        F0 = np.empty_like(f)
+        for lo, hi in self._acq_bounds(f.shape[1]):
+            seg = gaussian_filter1d(f[:, lo:hi], sigma_s * fs, axis=1, mode="nearest")
+            seg = minimum_filter1d(seg, w, axis=1, mode="nearest")
+            F0[:, lo:hi] = maximum_filter1d(seg, w, axis=1, mode="nearest")
+        return F0
+
     def compute_dff(self, size=225, method="session", neuropil_coeff=None,
-                    detrend=False, detrend_deg=3, deconvolve=False):
+                    detrend=False, detrend_deg=3, deconvolve=False, light_correct=False,
+                    dark_offset=None, baseline_win_s=30.0, baseline_sigma_s=1.0):
         """Compute dF/F and Z-scored dF/F.
 
-        method="session" (Willmore et al. 2023, Neuron; default): F = F_roi - c*Fneu,
-            F0 = mean(F) over the WHOLE session, dF/F = (F-F0)/F0, and Z-scored dF/F
-            = (F-F0) / SD(F), with SD over the whole session, per neuron. Fast, and
-            does not attenuate sustained responses.
-        method="rolling": legacy pydff — rolling ``baseline_pct``-percentile
-            baseline over +/-``size`` frames (can compress sustained responses).
+        Order: (1) subtract ``dark_offset`` from F and Fneu, (2) subtract the
+        additive light-bleed trace (``light_correct``), (3) neuropil subtraction
+        f = F - c*Fneu, (4) baseline F0 and dF/F = (f - F0) / F0.
 
-        ``neuropil_coeff`` overrides the instance default for this call (Willmore
-        uses 0.58; the pydff default is 0.7). ``self.dff`` and ``self.z_dff`` are
-        set; the tensor for the paper's "Z-scored dF/F" figures is ``z_dff``.
+        method="maximin" (recommended for GRIN / drifting data): F0(t) is a
+            running baseline (``_maximin_baseline``: smooth ``baseline_sigma_s``,
+            min then max over ``baseline_win_s``), per acquisition. Removes
+            bleaching and slow brightness drift; ``detrend`` is not needed.
+        method="session" (Willmore et al. 2023): F0 = mean(f) over the whole
+            session (optionally after a per-acquisition polynomial ``detrend``).
+        method="rolling": legacy pydff — rolling ``baseline_pct``-percentile.
+
+        ``dark_offset``: the detector's zero level is inside raw F; left in, it
+        inflates F0 and shrinks dF/F by a cell-dependent factor. None / "auto" /
+        number (see ``resolve_dark_offset``).
+        ``light_correct=True`` subtracts the additive light-bleed trace
+        (``estimate_light``) from F and Fneu before neuropil subtraction —
+        neuropil subtraction alone leaves (1 - c) of the stray light in every cell.
+        z_dff = dF/F z-scored per neuron over the session (kept for compatibility).
         """
         c = self.neuropil_coeff if neuropil_coeff is None else neuropil_coeff
         F = self.suite2p["F"].astype(float)
         Fneu = self.suite2p["Fneu"].astype(float)
+        dark = self.resolve_dark_offset(dark_offset)
+        if dark:
+            F, Fneu = F - dark, Fneu - dark
+            self._log(f"[dff] dark offset: subtracted {dark:.1f} F units from F and Fneu")
+        self.dark_offset = dark
+        if light_correct:
+            L = self.estimate_light()
+            F, Fneu = F - L, Fneu - L
+            self._log(f"[dff] light-bleed correction: removed additive trace "
+                      f"(1-99th pct {np.percentile(L, 1):.1f} to {np.percentile(L, 99):.1f} F units)")
         f_corr = F - c * Fneu
-        if detrend:
-            f_corr = self._detrend_per_acquisition(f_corr, detrend_deg)
-            self._log(f"[dff] per-acquisition bleaching detrend (deg {detrend_deg})")
-        if method == "session":
-            F0 = f_corr.mean(1, keepdims=True)
-            sd = f_corr.std(1, keepdims=True) + 1e-9
-            self.dff = (f_corr - F0) / F0
-            self.z_dff = (f_corr - F0) / sd
-            self._log(f"[dff] Willmore session dF/F: {self.dff.shape} (neuropil c={c})")
-        else:
-            win = 2 * int(size) + 1
-            base_corr = percentile_filter(f_corr, self.baseline_pct, size=(1, win), mode="reflect")
-            base_raw = percentile_filter(F, self.baseline_pct, size=(1, win), mode="reflect")
+        if method == "maximin":
+            F0 = self._maximin_baseline(f_corr, baseline_win_s, baseline_sigma_s)
+            if np.any(F0 <= 0):
+                bad = np.where((F0 <= 0).any(1))[0].tolist()
+                self._log(f"[dff] !! F0 <= 0 for neurons {bad} — check dark offset / neuropil coeff")
             with np.errstate(divide="ignore", invalid="ignore"):
-                dff = (f_corr - base_corr) / base_raw
-            self.dff = np.nan_to_num(dff, nan=0.0, posinf=0.0, neginf=0.0)
-            self.z_dff = (self.dff - self.dff.mean(1, keepdims=True)) / (self.dff.std(1, keepdims=True) + 1e-12)
-            self._log(f"[dff] rolling dF/F: {self.dff.shape}, win={win} frames (neuropil c={c})")
+                self.dff = (f_corr - F0) / F0
+            self.F0 = F0.astype(np.float32)
+            self._log(f"[dff] maximin dF/F: {self.dff.shape} (F0 window {baseline_win_s:g} s, "
+                      f"smooth {baseline_sigma_s:g} s, neuropil c={c})")
+        else:
+            if detrend:
+                f_corr = self._detrend_per_acquisition(f_corr, detrend_deg)
+                self._log(f"[dff] per-acquisition bleaching detrend (deg {detrend_deg})")
+            if method == "session":
+                F0 = f_corr.mean(1, keepdims=True)
+                self.dff = (f_corr - F0) / F0
+                self._log(f"[dff] Willmore session dF/F: {self.dff.shape} (neuropil c={c})")
+            else:
+                win = 2 * int(size) + 1
+                base_corr = percentile_filter(f_corr, self.baseline_pct, size=(1, win), mode="reflect")
+                base_raw = percentile_filter(F, self.baseline_pct, size=(1, win), mode="reflect")
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    dff = (f_corr - base_corr) / base_raw
+                self.dff = np.nan_to_num(dff, nan=0.0, posinf=0.0, neginf=0.0)
+                self._log(f"[dff] rolling dF/F: {self.dff.shape}, win={win} frames (neuropil c={c})")
+        self.z_dff = (self.dff - self.dff.mean(1, keepdims=True)) / (self.dff.std(1, keepdims=True) + 1e-12)
         if deconvolve:
             self.deconv = self._oasis_deconv(self.dff)
         return self
 
     def compute_activity(self, cache_path=None, size=225, method="session", neuropil_coeff=None,
-                         detrend=True, detrend_deg=3, deconvolve=True, force=False):
-        """Load cached dff/z_dff/deconv if ``cache_path`` exists, else compute + save.
-
-        The slow steps (rolling-percentile dff + OASIS deconvolution over thousands
-        of neurons) are skipped entirely when a cache is found. Pass ``force=True``
-        to recompute. Cache format matches all_activity_py.pkl:
-        {"dff", "z_dff", "deconv", "celi"}.
-        """
+                         detrend=True, detrend_deg=3, deconvolve=True, force=False,
+                         light_correct=False, dark_offset=None, baseline_win_s=30.0,
+                         baseline_sigma_s=1.0):
+        """Load cached dff/z_dff/deconv if ``cache_path`` exists and was computed
+        with the same parameters, else compute + save. Pass ``force=True`` to
+        recompute. Arguments are passed to ``compute_dff``."""
         import os, pickle
         c = self.neuropil_coeff if neuropil_coeff is None else neuropil_coeff
+        params = {"method": method, "neuropil_coeff": c,
+                  "detrend": detrend if method != "maximin" else None,
+                  "light_correct": light_correct,
+                  "dark_offset": self.resolve_dark_offset(dark_offset),
+                  "baseline_win_s": baseline_win_s if method == "maximin" else None,
+                  "baseline_sigma_s": baseline_sigma_s if method == "maximin" else None,
+                  # identify the source data so a cache from another session is never reused
+                  "suite2p_path": str(self.suite2p_path),
+                  "cell_idx": [int(i) for i in self.suite2p["cell_idx"]],
+                  "nframes": int(self.suite2p["nframes"])}
         if cache_path and not force and os.path.exists(cache_path):
             with open(cache_path, "rb") as f:
                 act = pickle.load(f)
-            if act.get("method") != method or act.get("neuropil_coeff") != c or act.get("detrend") != detrend:
-                self._log(f"[activity] cache is method={act.get('method')}/c={act.get('neuropil_coeff')} "
-                          f"but you asked for {method}/c={c} — recomputing")
+            if act.get("params") != params:
+                self._log(f"[activity] cache params {act.get('params')} != requested {params} — recomputing")
             else:
                 self.dff = np.asarray(act["dff"])
+                self.light = None if act.get("light") is None else np.asarray(act["light"])
+                self.F0 = None if act.get("F0") is None else np.asarray(act["F0"])
+                self.dark_offset = params["dark_offset"]
                 self.z_dff = None if act.get("z_dff") is None else np.asarray(act["z_dff"])
                 self.deconv = None if act.get("deconv") is None else np.asarray(act["deconv"])
                 if self.suite2p and act.get("celi") is not None:
@@ -570,11 +687,13 @@ class AlignmentSession:
                 if self.suite2p and self.suite2p.get("nframes") and self.dff.shape[1] != self.suite2p["nframes"]:
                     self._log(f"[activity] !! cached dff has {self.dff.shape[1]} frames but suite2p "
                               f"nframes={self.suite2p['nframes']} — cache may be stale (use force=True)")
-                self._log(f"[activity] loaded cache {os.path.basename(cache_path)} (method={method}): "
+                self._log(f"[activity] loaded cache {os.path.basename(cache_path)} ({params}): "
                           f"dff {self.dff.shape}" + ("" if self.deconv is None else f", deconv {self.deconv.shape}"))
                 return self
         self.compute_dff(size=size, method=method, neuropil_coeff=neuropil_coeff,
-                         detrend=detrend, detrend_deg=detrend_deg)
+                         detrend=detrend, detrend_deg=detrend_deg, light_correct=light_correct,
+                         dark_offset=dark_offset, baseline_win_s=baseline_win_s,
+                         baseline_sigma_s=baseline_sigma_s)
         if deconvolve:
             try:
                 self.deconv = self._oasis_deconv(self.dff)
@@ -584,8 +703,49 @@ class AlignmentSession:
         if cache_path:
             celi = self.suite2p.get("cell_idx") if self.suite2p else None
             self.save_pickle({"dff": self.dff, "z_dff": self.z_dff, "deconv": self.deconv,
-                              "celi": celi, "method": method, "neuropil_coeff": c,
-                              "detrend": detrend}, cache_path)
+                              "celi": celi, "params": params,
+                              "light": self.light if light_correct else None,
+                              "F0": getattr(self, "F0", None) if method == "maximin" else None},
+                             cache_path)
+        return self
+
+    def cell_qc(self, min_f0=1.0, max_noise=None):
+        """Per-cell quality table from the computed dF/F.
+
+        A cell fails if its baseline F0 ever drops to <= ``min_f0`` raw F units
+        (dF/F undefined / exploding: the neuropil-corrected signal sits at the
+        dark level) or, if ``max_noise`` is set, its frame-to-frame dF/F noise
+        (robust SD) exceeds it. Returns a DataFrame (neuron, roi, F0_median,
+        F0_min, dff_noise, keep, reason)."""
+        import pandas as pd
+        F0 = self.F0 if self.F0 is not None else np.broadcast_to(
+            np.nanmean(self.dff, axis=1, keepdims=True), self.dff.shape)
+        noise = 1.4826 * np.nanmedian(np.abs(np.diff(self.dff, axis=1)), axis=1) / np.sqrt(2)
+        rows = []
+        for k in range(self.dff.shape[0]):
+            reason = []
+            if np.nanmin(F0[k]) <= min_f0:
+                reason.append(f"F0 min {np.nanmin(F0[k]):.2f} <= {min_f0}")
+            if max_noise is not None and noise[k] > max_noise:
+                reason.append(f"noise {noise[k]:.3f} > {max_noise}")
+            rows.append({"neuron": k, "roi": int(self.suite2p["cell_idx"][k]),
+                         "F0_median": float(np.nanmedian(F0[k])), "F0_min": float(np.nanmin(F0[k])),
+                         "dff_noise": float(noise[k]), "keep": not reason, "reason": "; ".join(reason)})
+        return pd.DataFrame(rows)
+
+    def apply_cell_qc(self, keep):
+        """Keep only cells where ``keep`` is True, in every per-cell array
+        (dff, z_dff, deconv, F0, suite2p F/Fneu/spks/cell_idx)."""
+        keep = np.asarray(keep, bool)
+        for name in ("dff", "z_dff", "deconv", "F0"):
+            arr = getattr(self, name, None)
+            if arr is not None:
+                setattr(self, name, np.asarray(arr)[keep])
+        for key in ("F", "Fneu", "spks", "cell_idx"):
+            if self.suite2p.get(key) is not None:
+                self.suite2p[key] = np.asarray(self.suite2p[key])[keep]
+        dropped = int((~keep).sum())
+        self._log(f"[qc] kept {int(keep.sum())}/{len(keep)} cells" + (f" (dropped {dropped})" if dropped else ""))
         return self
 
     @staticmethod
